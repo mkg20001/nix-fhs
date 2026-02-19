@@ -72,15 +72,11 @@ enum Commands {
 }
 
 fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("dev")
+    dirs::cache_dir().unwrap().join("dev")
 }
 
 fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("dev")
+    dirs::config_dir().unwrap().join("dev")
 }
 
 fn has_flakes() -> bool {
@@ -134,6 +130,58 @@ fn spawn_inherit(cmd: &str, args: &[&str], nix_path: Option<&str>) -> Result<boo
     Ok(status.success())
 }
 
+/// Represents a package reference - either from a channel or a flake
+#[derive(Clone, Debug, PartialEq)]
+enum PackageRef {
+    /// Channel package: channel.attr (e.g., nixpkgs.git)
+    Channel { source: String, attr: String },
+    /// Flake package: flake#attr (e.g., nixpkgs#git)
+    Flake { source: String, attr: String },
+}
+
+impl PackageRef {
+    fn parse(s: &str) -> Option<Self> {
+        if let Some((source, attr)) = s.split_once('#') {
+            Some(PackageRef::Flake {
+                source: source.to_string(),
+                attr: attr.to_string(),
+            })
+        } else if let Some((source, attr)) = s.split_once('.') {
+            Some(PackageRef::Channel {
+                source: source.to_string(),
+                attr: attr.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn source_name(&self) -> &str {
+        match self {
+            PackageRef::Channel { source, .. } => source,
+            PackageRef::Flake { source, .. } => source,
+        }
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            PackageRef::Channel { source, attr } => format!("{}.{}", source, attr),
+            PackageRef::Flake { source, attr } => format!("{}#{}", source, attr),
+        }
+    }
+
+    /// Returns the nix expression to access this package
+    fn to_nix_expr(&self) -> String {
+        match self {
+            PackageRef::Channel { source, attr } => format!("{}.{}", source, attr),
+            PackageRef::Flake { source, attr } => {
+                // Flakes are imported directly, so they work like channels
+                format!("_flake_{}.{}", source, attr)
+            }
+        }
+    }
+}
+
 struct Storage {
     packages: Vec<String>,
     disk_path: PathBuf,
@@ -165,8 +213,7 @@ impl Storage {
 
     fn write(&self) -> Result<()> {
         fs::create_dir_all(config_dir())?;
-        fs::write(&self.disk_path, self.packages.join("\n"))
-            .context("Failed to write storage")?;
+        fs::write(&self.disk_path, self.packages.join("\n")).context("Failed to write storage")?;
         Ok(())
     }
 
@@ -184,26 +231,49 @@ impl Storage {
     fn contains(&self, pkg: &str) -> bool {
         self.packages.contains(&pkg.to_string())
     }
+
+    fn get_refs(&self) -> Vec<PackageRef> {
+        self.packages.iter().filter_map(|p| PackageRef::parse(p)).collect()
+    }
 }
 
-struct Channels {
-    disk_path: PathBuf,
+/// Manages both channels and flakes as sources
+struct Sources {
+    channels_path: PathBuf,
+    flakes_path: PathBuf,
 }
 
-impl Channels {
+impl Sources {
     fn new(env: &str) -> Result<Self> {
-        let disk_path = cache_dir().join(env).join("channels");
-        fs::create_dir_all(&disk_path)?;
+        let base = cache_dir().join(env);
+        let channels_path = base.join("channels");
+        let flakes_path = base.join("flakes");
+        fs::create_dir_all(&channels_path)?;
+        fs::create_dir_all(&flakes_path)?;
 
-        Ok(Channels { disk_path })
+        Ok(Sources {
+            channels_path,
+            flakes_path,
+        })
     }
 
-    fn has(&self, name: &str) -> bool {
-        self.disk_path.join(name).exists()
+    fn has_channel(&self, name: &str) -> bool {
+        self.channels_path.join(name).exists()
     }
 
-    fn list(&self) -> Vec<String> {
-        fs::read_dir(&self.disk_path)
+    fn has_flake(&self, name: &str) -> bool {
+        self.flakes_path.join(name).exists()
+    }
+
+    fn has(&self, pkg_ref: &PackageRef) -> bool {
+        match pkg_ref {
+            PackageRef::Channel { source, .. } => self.has_channel(source),
+            PackageRef::Flake { source, .. } => self.has_flake(source),
+        }
+    }
+
+    fn list_channels(&self) -> Vec<String> {
+        fs::read_dir(&self.channels_path)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
@@ -213,14 +283,25 @@ impl Channels {
             .unwrap_or_default()
     }
 
-    fn update(&self, name: &str, verbose: bool) -> Result<()> {
+    fn list_flakes(&self) -> Vec<String> {
+        fs::read_dir(&self.flakes_path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn update_channel(&self, name: &str, verbose: bool) -> Result<()> {
         if verbose {
             eprintln!("Updating channel: {}", name);
         }
 
         let channel_path = resolve_channel(name)?;
 
-        let gc_root = self.disk_path.join(name);
+        let gc_root = self.channels_path.join(name);
         if gc_root.exists() {
             fs::remove_file(&gc_root).ok();
         }
@@ -239,42 +320,98 @@ impl Channels {
         )?;
 
         if !result.success {
-            bail!("Failed to update channel {}: {}", name, result.stderr.trim());
+            bail!(
+                "Failed to update channel {}: {}",
+                name,
+                result.stderr.trim()
+            );
         }
 
         Ok(())
     }
 
-    fn remove(&self, name: &str) {
-        let path = self.disk_path.join(name);
+    fn update_flake(&self, name: &str, verbose: bool) -> Result<()> {
+        if verbose {
+            eprintln!("Updating flake: {}", name);
+        }
+
+        if !has_flakes() {
+            bail!("Flakes are not enabled in your nix installation");
+        }
+
+        let flake_path = resolve_flake(name)?;
+
+        let gc_root = self.flakes_path.join(name);
+        if gc_root.exists() {
+            fs::remove_file(&gc_root).ok();
+        }
+
+        let result = spawn(
+            "nix-store",
+            &[
+                "--realise",
+                &flake_path,
+                "--indirect",
+                "--add-root",
+                gc_root.to_str().unwrap(),
+            ],
+            true,
+            None,
+        )?;
+
+        if !result.success {
+            bail!("Failed to update flake {}: {}", name, result.stderr.trim());
+        }
+
+        Ok(())
+    }
+
+    fn update_source(&self, pkg_ref: &PackageRef, verbose: bool) -> Result<()> {
+        match pkg_ref {
+            PackageRef::Channel { source, .. } => self.update_channel(source, verbose),
+            PackageRef::Flake { source, .. } => self.update_flake(source, verbose),
+        }
+    }
+
+    fn remove_channel(&self, name: &str) {
+        let path = self.channels_path.join(name);
+        if path.exists() {
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    fn remove_flake(&self, name: &str) {
+        let path = self.flakes_path.join(name);
         if path.exists() {
             fs::remove_file(&path).ok();
         }
     }
 
     fn get_nix_path(&self) -> String {
-        self.list()
+        self.list_channels()
             .iter()
             .map(|channel| {
                 format!(
                     "{}={}",
                     channel,
-                    self.disk_path.join(channel).display()
+                    self.channels_path.join(channel).display()
                 )
             })
             .collect::<Vec<_>>()
             .join(":")
     }
+
+    fn get_flake_paths(&self) -> Vec<(String, PathBuf)> {
+        self.list_flakes()
+            .iter()
+            .map(|flake| (flake.clone(), self.flakes_path.join(flake)))
+            .collect()
+    }
 }
 
 fn resolve_channel(name: &str) -> Result<String> {
-    let flakes = has_flakes();
     let expr = format!("(<{}>)", name);
-    let args: Vec<&str> = if flakes {
-        vec!["eval", "--raw", "--impure", "--expr", &expr]
-    } else {
-        vec!["eval", "--raw", &expr]
-    };
+    let args = vec!["eval", "--raw", "--impure", "--expr", &expr];
 
     let result = spawn("nix", &args, true, None)?;
 
@@ -286,34 +423,32 @@ fn resolve_channel(name: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn check_if_package_exists(attr: &str, channels: &Channels) -> Result<bool> {
-    if !attr.contains('.') {
-        return Ok(false);
+fn resolve_flake(name: &str) -> Result<String> {
+    let expr = format!("(builtins.getFlake \"{}\").outPath", name);
+    let args = vec!["eval", "--raw", "--impure", "--expr", &expr];
+
+    let result = spawn("nix", &args, true, None)?;
+
+    let path = result.stdout.trim();
+    if !path.starts_with('/') {
+        bail!("nix: {}", result.stderr.trim());
     }
 
-    let parts: Vec<&str> = attr.split('.').collect();
-    let channel = parts[0];
-    let channel_attr: Vec<String> = parts[1..].iter().map(|s| format!("\"{}\"", s)).collect();
+    Ok(path.to_string())
+}
+
+fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources) -> Result<bool> {
+    let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
 
     let expr = format!(
         "(let ch = (import <{}> {{}}); in ch ? {})",
         channel,
-        channel_attr.join(".")
+        attr_parts.join(".")
     );
 
-    let flakes = has_flakes();
-    let args: Vec<&str> = if flakes {
-        vec!["eval", "--impure", "--expr", &expr]
-    } else {
-        vec!["eval", &expr]
-    };
+    let args = vec!["eval", "--impure", "--expr", &expr];
 
-    let result = spawn(
-        "nix",
-        &args,
-        true,
-        Some(&channels.get_nix_path()),
-    )?;
+    let result = spawn("nix", &args, true, Some(&sources.get_nix_path()))?;
 
     if !result.success {
         bail!("nix: {}", result.stderr.trim());
@@ -322,26 +457,86 @@ fn check_if_package_exists(attr: &str, channels: &Channels) -> Result<bool> {
     Ok(result.stdout.trim() == "true")
 }
 
-fn generate_nix(name: &str, storage: &Storage, channels: &Channels) -> String {
-    let channel_imports: String = channels
-        .list()
+fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
+    if !has_flakes() {
+        bail!("Flakes are not enabled in your nix installation");
+    }
+
+    let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
+
+    // First try legacyPackages (standard flake output)
+    let expr = format!(
+        "(let f = builtins.getFlake \"{}\"; in f.legacyPackages.${{builtins.currentSystem}} ? {})",
+        flake,
+        attr_parts.join(".")
+    );
+
+    let args = vec!["eval", "--impure", "--expr", &expr];
+    let result = spawn("nix", &args, true, None)?;
+
+    if result.success && result.stdout.trim() == "true" {
+        return Ok(true);
+    }
+
+    // Also try packages output
+    let expr = format!(
+        "(let f = builtins.getFlake \"{}\"; in f.packages.${{builtins.currentSystem}} ? {})",
+        flake,
+        attr_parts.join(".")
+    );
+
+    let args = vec!["eval", "--impure", "--expr", &expr];
+    let result = spawn("nix", &args, true, None)?;
+
+    if !result.success {
+        bail!("nix: {}", result.stderr.trim());
+    }
+
+    Ok(result.stdout.trim() == "true")
+}
+
+fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources) -> Result<bool> {
+    match pkg_ref {
+        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, sources),
+        PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr),
+    }
+}
+
+fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
+    let channel_imports: String = sources
+        .list_channels()
         .iter()
         .map(|ch| format!("  {} = import <{}> {{}};", ch, ch))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let packages: String = storage
-        .packages
+    let flake_imports: String = sources
+        .get_flake_paths()
         .iter()
-        .map(|p| format!("    ({})", p))
+        .map(|(name, path)| format!("  _flake_{} = import {} {{}};", name, path.display()))
         .collect::<Vec<_>>()
         .join("\n");
+
+    let packages: String = storage
+        .get_refs()
+        .iter()
+        .map(|p| format!("    ({})", p.to_nix_expr()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let all_imports = if flake_imports.is_empty() {
+        channel_imports
+    } else if channel_imports.is_empty() {
+        flake_imports
+    } else {
+        format!("{}\n{}", channel_imports, flake_imports)
+    };
 
     format!(
         r#"{{ pkgs ? import <nixpkgs> {{}} }}:
 
 let
-{channel_imports}
+{all_imports}
 in
 (pkgs.buildFHSEnv {{
   name = "dev-{name}";
@@ -361,13 +556,13 @@ in
 
   runScript = ''$SHELL'';
 }})"#,
-        channel_imports = channel_imports,
+        all_imports = all_imports,
         name = name,
         packages = packages,
     )
 }
 
-fn rebuild(env: &str, storage: &Storage, channels: &Channels, verbose: bool) -> Result<()> {
+fn rebuild(env: &str, storage: &Storage, sources: &Sources, verbose: bool) -> Result<()> {
     let env_cache = cache_dir().join(env);
     fs::create_dir_all(&env_cache)?;
 
@@ -378,8 +573,12 @@ fn rebuild(env: &str, storage: &Storage, channels: &Channels, verbose: bool) -> 
         eprintln!("Generating nix expression");
     }
 
-    let nix_content = generate_nix(env, storage, channels);
-    fs::write(&nix_path, nix_content)?;
+    let nix_content = generate_nix(env, storage, sources);
+    fs::write(&nix_path, &nix_content)?;
+
+    if verbose {
+        eprintln!("Generated nix:\n{}", nix_content);
+    }
 
     println!("rebuilding {}...", env);
 
@@ -390,7 +589,7 @@ fn rebuild(env: &str, storage: &Storage, channels: &Channels, verbose: bool) -> 
             "-o",
             result_path.to_str().unwrap(),
         ],
-        Some(&channels.get_nix_path()),
+        Some(&sources.get_nix_path()),
     )?;
 
     if !success {
@@ -400,28 +599,48 @@ fn rebuild(env: &str, storage: &Storage, channels: &Channels, verbose: bool) -> 
     Ok(())
 }
 
-fn routine_stuff(storage: &Storage, channels: &Channels, verbose: bool) -> Result<()> {
-    // Ensure nixpkgs channel exists
-    if !channels.has("nixpkgs") {
-        channels.update("nixpkgs", verbose)?;
+fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<()> {
+    // Ensure nixpkgs channel exists (needed for buildFHSEnv)
+    if !sources.has_channel("nixpkgs") {
+        sources.update_channel("nixpkgs", verbose)?;
     }
 
-    // Determine which channels we need
-    let mut should_have: HashSet<String> = storage
-        .packages
-        .iter()
-        .filter_map(|p| p.split('.').next())
-        .map(String::from)
-        .collect();
-    should_have.insert("nixpkgs".to_string());
+    // Determine which sources we need
+    let refs = storage.get_refs();
 
-    // GC unused channels
-    for channel in channels.list() {
-        if !should_have.contains(&channel) {
+    let needed_channels: HashSet<String> = refs
+        .iter()
+        .filter_map(|r| match r {
+            PackageRef::Channel { source, .. } => Some(source.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let needed_flakes: HashSet<String> = refs
+        .iter()
+        .filter_map(|r| match r {
+            PackageRef::Flake { source, .. } => Some(source.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // GC unused channels (but always keep nixpkgs)
+    for channel in sources.list_channels() {
+        if channel != "nixpkgs" && !needed_channels.contains(&channel) {
             if verbose {
                 eprintln!("GC channel: {}", channel);
             }
-            channels.remove(&channel);
+            sources.remove_channel(&channel);
+        }
+    }
+
+    // GC unused flakes
+    for flake in sources.list_flakes() {
+        if !needed_flakes.contains(&flake) {
+            if verbose {
+                eprintln!("GC flake: {}", flake);
+            }
+            sources.remove_flake(&flake);
         }
     }
 
@@ -441,69 +660,103 @@ fn env_not_found(env: &str) {
     std::process::exit(1);
 }
 
-fn cmd_add(
-    env: &str,
-    pkgs: Vec<String>,
-    auto_rebuild: bool,
-    verbose: bool,
-) -> Result<()> {
+fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let mut storage = Storage::new(env);
-    let channels = Channels::new(env)?;
+    let sources = Sources::new(env)?;
 
-    routine_stuff(&storage, &channels, verbose)?;
+    routine_stuff(&storage, &sources, verbose)?;
 
     let mut had_errors = false;
 
-    for mut pkg in pkgs {
-        match check_if_package_exists(&pkg, &channels) {
-            Ok(true) => {}
-            Ok(false) => {
+    for pkg in pkgs {
+        // Parse the package reference
+        let pkg_ref = match PackageRef::parse(&pkg) {
+            Some(r) => r,
+            None => {
+                // No prefix, try nixpkgs.pkg first, then nixpkgs#pkg
                 if verbose {
-                    eprintln!("{}: not found, trying nixpkgs prefix", pkg);
+                    eprintln!("{}: no source prefix, trying nixpkgs.{}", pkg, pkg);
                 }
-                let prefixed = format!("nixpkgs.{}", pkg);
-                match check_if_package_exists(&prefixed, &channels) {
+
+                let channel_ref = PackageRef::Channel {
+                    source: "nixpkgs".to_string(),
+                    attr: pkg.clone(),
+                };
+
+                match check_package_exists(&channel_ref, &sources) {
                     Ok(true) => {
                         if verbose {
-                            eprintln!("{}: found as {}", pkg, prefixed);
+                            eprintln!("{}: found as nixpkgs.{}", pkg, pkg);
                         }
-                        pkg = prefixed;
+                        channel_ref
                     }
-                    Ok(false) => {
-                        eprintln!("{}: does not exist or fails to evaluate", pkg);
-                        had_errors = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("{}: {}", pkg, e);
-                        had_errors = true;
-                        continue;
+                    _ => {
+                        // Try flake
+                        if verbose {
+                            eprintln!("{}: not in channel, trying nixpkgs#{}", pkg, pkg);
+                        }
+                        let flake_ref = PackageRef::Flake {
+                            source: "nixpkgs".to_string(),
+                            attr: pkg.clone(),
+                        };
+
+                        match check_package_exists(&flake_ref, &sources) {
+                            Ok(true) => {
+                                if verbose {
+                                    eprintln!("{}: found as nixpkgs#{}", pkg, pkg);
+                                }
+                                flake_ref
+                            }
+                            Ok(false) => {
+                                eprintln!("{}: does not exist or fails to evaluate", pkg);
+                                had_errors = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("{}: {}", pkg, e);
+                                had_errors = true;
+                                continue;
+                            }
+                        }
                     }
                 }
             }
+        };
+
+        // Verify package exists
+        match check_package_exists(&pkg_ref, &sources) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("{}: does not exist or fails to evaluate", pkg_ref.to_string());
+                had_errors = true;
+                continue;
+            }
             Err(e) => {
-                eprintln!("{}: {}", pkg, e);
+                eprintln!("{}: {}", pkg_ref.to_string(), e);
                 had_errors = true;
                 continue;
             }
         }
 
-        let channel = pkg.split('.').next().unwrap();
-
-        if !channels.has(channel) {
+        // Ensure source is available
+        if !sources.has(&pkg_ref) {
             if verbose {
-                eprintln!("Adding channel: {}", channel);
+                eprintln!("Adding source: {}", pkg_ref.source_name());
             }
-            channels.update(channel, verbose)?;
+            if let Err(e) = sources.update_source(&pkg_ref, verbose) {
+                eprintln!("{}: failed to add source: {}", pkg_ref.to_string(), e);
+                had_errors = true;
+                continue;
+            }
         }
 
-        storage.add(&pkg);
+        storage.add(&pkg_ref.to_string());
     }
 
     storage.write()?;
 
     if auto_rebuild {
-        rebuild(env, &storage, &channels, verbose)?;
+        rebuild(env, &storage, &sources, verbose)?;
     }
 
     if had_errors {
@@ -513,37 +766,48 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_rm(
-    env: &str,
-    pkgs: Vec<String>,
-    auto_rebuild: bool,
-    verbose: bool,
-) -> Result<()> {
+fn cmd_rm(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let mut storage = Storage::new(env);
-    let channels = Channels::new(env)?;
+    let sources = Sources::new(env)?;
 
-    for mut pkg in pkgs {
-        if !storage.contains(&pkg) {
-            let prefixed = format!("nixpkgs.{}", pkg);
-            if storage.contains(&prefixed) {
-                pkg = prefixed;
-            } else {
-                println!("{}: not installed", pkg);
-                continue;
+    for pkg in pkgs {
+        // Try exact match first
+        if storage.contains(&pkg) {
+            if verbose {
+                eprintln!("Removing: {}", pkg);
             }
+            storage.remove(&pkg);
+            continue;
         }
 
-        if verbose {
-            eprintln!("Removing: {}", pkg);
+        // Try with nixpkgs. prefix
+        let channel_pkg = format!("nixpkgs.{}", pkg);
+        if storage.contains(&channel_pkg) {
+            if verbose {
+                eprintln!("Removing: {}", channel_pkg);
+            }
+            storage.remove(&channel_pkg);
+            continue;
         }
-        storage.remove(&pkg);
+
+        // Try with nixpkgs# prefix
+        let flake_pkg = format!("nixpkgs#{}", pkg);
+        if storage.contains(&flake_pkg) {
+            if verbose {
+                eprintln!("Removing: {}", flake_pkg);
+            }
+            storage.remove(&flake_pkg);
+            continue;
+        }
+
+        println!("{}: not installed", pkg);
     }
 
-    routine_stuff(&storage, &channels, verbose)?;
+    routine_stuff(&storage, &sources, verbose)?;
     storage.write()?;
 
     if auto_rebuild {
-        rebuild(env, &storage, &channels, verbose)?;
+        rebuild(env, &storage, &sources, verbose)?;
     }
 
     Ok(())
@@ -555,21 +819,15 @@ fn cmd_rebuild(env: &str, verbose: bool) -> Result<()> {
         env_not_found(env);
     }
 
-    let channels = Channels::new(env)?;
+    let sources = Sources::new(env)?;
 
-    routine_stuff(&storage, &channels, verbose)?;
-    rebuild(env, &storage, &channels, verbose)?;
+    routine_stuff(&storage, &sources, verbose)?;
+    rebuild(env, &storage, &sources, verbose)?;
 
     Ok(())
 }
 
-fn cmd_update(
-    env: &str,
-    fetch: bool,
-    all: bool,
-    auto_rebuild: bool,
-    verbose: bool,
-) -> Result<()> {
+fn cmd_update(env: &str, fetch: bool, all: bool, auto_rebuild: bool, verbose: bool) -> Result<()> {
     if fetch {
         println!("Fetching channels...");
         spawn_inherit("nix-channel", &["--update", "-vv"], None)?;
@@ -596,17 +854,22 @@ fn cmd_update(
             env_not_found(&env);
         }
 
-        let channels = Channels::new(&env)?;
+        let sources = Sources::new(&env)?;
 
-        routine_stuff(&storage, &channels, verbose)?;
+        routine_stuff(&storage, &sources, verbose)?;
 
         println!("Updating environment: {}", env);
-        for channel in channels.list() {
-            channels.update(&channel, verbose)?;
+
+        for channel in sources.list_channels() {
+            sources.update_channel(&channel, verbose)?;
+        }
+
+        for flake in sources.list_flakes() {
+            sources.update_flake(&flake, verbose)?;
         }
 
         if auto_rebuild {
-            rebuild(&env, &storage, &channels, verbose)?;
+            rebuild(&env, &storage, &sources, verbose)?;
         }
     }
 
@@ -619,14 +882,16 @@ fn cmd_info(env: &str, json: bool) -> Result<()> {
         env_not_found(env);
     }
 
-    let channels = Channels::new(env)?;
-    let channel_list = channels.list();
+    let sources = Sources::new(env)?;
+    let channel_list = sources.list_channels();
+    let flake_list = sources.list_flakes();
     let package_list = &storage.packages;
 
     if json {
         let output = serde_json::json!({
-            "channelList": channel_list,
-            "packageList": package_list,
+            "channels": channel_list,
+            "flakes": flake_list,
+            "packages": package_list,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -638,6 +903,15 @@ fn cmd_info(env: &str, json: bool) -> Result<()> {
         } else {
             for ch in &channel_list {
                 println!(" - {}", ch);
+            }
+        }
+
+        println!("\nFlakes:");
+        if flake_list.is_empty() {
+            println!(" - <empty>");
+        } else {
+            for fl in &flake_list {
+                println!(" - {}", fl);
             }
         }
 
@@ -660,7 +934,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
         env_not_found(env);
     }
 
-    let channels = Channels::new(env)?;
+    let sources = Sources::new(env)?;
     let bin = cache_dir()
         .join(env)
         .join("result")
@@ -678,12 +952,12 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
             std::process::exit(1);
         }
 
-        routine_stuff(&storage, &channels, verbose)?;
-        rebuild(env, &storage, &channels, verbose)?;
+        routine_stuff(&storage, &sources, verbose)?;
+        rebuild(env, &storage, &sources, verbose)?;
     }
 
     // exec into the dev environment
-    let nix_path = channels.get_nix_path();
+    let nix_path = sources.get_nix_path();
     let err = Command::new(&bin)
         .env("NIX_PATH", &nix_path)
         .env("NIX_DEV", env)
