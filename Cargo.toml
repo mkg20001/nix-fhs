@@ -1,0 +1,11 @@
+[package]
+name = "nix-dev"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dev"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
