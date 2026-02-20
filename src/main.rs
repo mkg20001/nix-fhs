@@ -235,6 +235,38 @@ impl Storage {
     fn get_refs(&self) -> Vec<PackageRef> {
         self.packages.iter().filter_map(|p| PackageRef::parse(p)).collect()
     }
+
+    fn list_channels(&self) -> Vec<String> {
+        let mut channels: Vec<String> = self
+            .packages
+            .iter()
+            .filter_map(|p| PackageRef::parse(p))
+            .filter_map(|r| match r {
+                PackageRef::Channel { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        channels.sort();
+        channels
+    }
+
+    fn list_flakes(&self) -> Vec<String> {
+        let mut flakes: Vec<String> = self
+            .packages
+            .iter()
+            .filter_map(|p| PackageRef::parse(p))
+            .filter_map(|r| match r {
+                PackageRef::Flake { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        flakes.sort();
+        flakes
+    }
 }
 
 /// Manages both channels and flakes as sources
@@ -270,28 +302,6 @@ impl Sources {
             PackageRef::Channel { source, .. } => self.has_channel(source),
             PackageRef::Flake { source, .. } => self.has_flake(source),
         }
-    }
-
-    fn list_channels(&self) -> Vec<String> {
-        fs::read_dir(&self.channels_path)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn list_flakes(&self) -> Vec<String> {
-        fs::read_dir(&self.flakes_path)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn update_channel(&self, name: &str, verbose: bool) -> Result<()> {
@@ -387,8 +397,33 @@ impl Sources {
         }
     }
 
-    fn get_nix_path(&self) -> String {
-        self.list_channels()
+    /// List channel GC roots that exist on disk (for garbage collection)
+    fn list_channel_roots(&self) -> Vec<String> {
+        fs::read_dir(&self.channels_path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// List flake GC roots that exist on disk (for garbage collection)
+    fn list_flake_roots(&self) -> Vec<String> {
+        fs::read_dir(&self.flakes_path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn get_nix_path(&self, storage: &Storage) -> String {
+        storage
+            .list_channels()
             .iter()
             .map(|channel| {
                 format!(
@@ -401,8 +436,9 @@ impl Sources {
             .join(":")
     }
 
-    fn get_flake_paths(&self) -> Vec<(String, PathBuf)> {
-        self.list_flakes()
+    fn get_flake_paths(&self, storage: &Storage) -> Vec<(String, PathBuf)> {
+        storage
+            .list_flakes()
             .iter()
             .map(|flake| (flake.clone(), self.flakes_path.join(flake)))
             .collect()
@@ -437,7 +473,7 @@ fn resolve_flake(name: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources) -> Result<bool> {
+fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources, storage: &Storage) -> Result<bool> {
     let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
 
     let expr = format!(
@@ -448,7 +484,7 @@ fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources) ->
 
     let args = vec!["eval", "--impure", "--expr", &expr];
 
-    let result = spawn("nix", &args, true, Some(&sources.get_nix_path()))?;
+    let result = spawn("nix", &args, true, Some(&sources.get_nix_path(storage)))?;
 
     if !result.success {
         bail!("nix: {}", result.stderr.trim());
@@ -495,15 +531,15 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
     Ok(result.stdout.trim() == "true")
 }
 
-fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources) -> Result<bool> {
+fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources, storage: &Storage) -> Result<bool> {
     match pkg_ref {
-        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, sources),
+        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, sources, storage),
         PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr),
     }
 }
 
 fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
-    let channel_imports: String = sources
+    let channel_imports: String = storage
         .list_channels()
         .iter()
         .map(|ch| format!("  {} = import <{}> {{}};", ch, ch))
@@ -511,7 +547,7 @@ fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
         .join("\n");
 
     let flake_imports: String = sources
-        .get_flake_paths()
+        .get_flake_paths(storage)
         .iter()
         .map(|(name, path)| format!("  _flake_{} = import {} {{}};", name, path.display()))
         .collect::<Vec<_>>()
@@ -589,7 +625,7 @@ fn rebuild(env: &str, storage: &Storage, sources: &Sources, verbose: bool) -> Re
             "-o",
             result_path.to_str().unwrap(),
         ],
-        Some(&sources.get_nix_path()),
+        Some(&sources.get_nix_path(storage)),
     )?;
 
     if !success {
@@ -625,7 +661,7 @@ fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<
         .collect();
 
     // GC unused channels (but always keep nixpkgs)
-    for channel in sources.list_channels() {
+    for channel in sources.list_channel_roots() {
         if channel != "nixpkgs" && !needed_channels.contains(&channel) {
             if verbose {
                 eprintln!("GC channel: {}", channel);
@@ -635,7 +671,7 @@ fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<
     }
 
     // GC unused flakes
-    for flake in sources.list_flakes() {
+    for flake in sources.list_flake_roots() {
         if !needed_flakes.contains(&flake) {
             if verbose {
                 eprintln!("GC flake: {}", flake);
@@ -683,7 +719,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                     attr: pkg.clone(),
                 };
 
-                match check_package_exists(&channel_ref, &sources) {
+                match check_package_exists(&channel_ref, &sources, &storage) {
                     Ok(true) => {
                         if verbose {
                             eprintln!("{}: found as nixpkgs.{}", pkg, pkg);
@@ -700,7 +736,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                             attr: pkg.clone(),
                         };
 
-                        match check_package_exists(&flake_ref, &sources) {
+                        match check_package_exists(&flake_ref, &sources, &storage) {
                             Ok(true) => {
                                 if verbose {
                                     eprintln!("{}: found as nixpkgs#{}", pkg, pkg);
@@ -724,7 +760,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
         };
 
         // Verify package exists
-        match check_package_exists(&pkg_ref, &sources) {
+        match check_package_exists(&pkg_ref, &sources, &storage) {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!("{}: does not exist or fails to evaluate", pkg_ref.to_string());
@@ -860,11 +896,11 @@ fn cmd_update(env: &str, fetch: bool, all: bool, auto_rebuild: bool, verbose: bo
 
         println!("Updating environment: {}", env);
 
-        for channel in sources.list_channels() {
+        for channel in storage.list_channels() {
             sources.update_channel(&channel, verbose)?;
         }
 
-        for flake in sources.list_flakes() {
+        for flake in storage.list_flakes() {
             sources.update_flake(&flake, verbose)?;
         }
 
@@ -882,9 +918,8 @@ fn cmd_info(env: &str, json: bool) -> Result<()> {
         env_not_found(env);
     }
 
-    let sources = Sources::new(env)?;
-    let channel_list = sources.list_channels();
-    let flake_list = sources.list_flakes();
+    let channel_list = storage.list_channels();
+    let flake_list = storage.list_flakes();
     let package_list = &storage.packages;
 
     if json {
@@ -957,7 +992,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
     }
 
     // exec into the dev environment
-    let nix_path = sources.get_nix_path();
+    let nix_path = sources.get_nix_path(&storage);
     let err = Command::new(&bin)
         .env("NIX_PATH", &nix_path)
         .env("NIX_DEV", env)
