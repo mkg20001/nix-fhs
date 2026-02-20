@@ -72,11 +72,19 @@ enum Commands {
 }
 
 fn cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap().join("dev")
+    if let Ok(path) = std::env::var("DEV_CACHE_DIR") {
+        PathBuf::from(path)
+    } else {
+        dirs::cache_dir().unwrap().join("dev")
+    }
 }
 
 fn config_dir() -> PathBuf {
-    dirs::config_dir().unwrap().join("dev")
+    if let Ok(path) = std::env::var("DEV_CONFIG_DIR") {
+        PathBuf::from(path)
+    } else {
+        dirs::config_dir().unwrap().join("dev")
+    }
 }
 
 fn has_flakes() -> bool {
@@ -1031,5 +1039,474 @@ fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // Mutex to ensure tests don't run in parallel (they modify env vars)
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct TestEnv {
+        _temp_dir: TempDir,
+        cache_path: PathBuf,
+        config_path: PathBuf,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_path = temp_dir.path().join("cache");
+            let config_path = temp_dir.path().join("config");
+
+            fs::create_dir_all(&cache_path).unwrap();
+            fs::create_dir_all(&config_path).unwrap();
+
+            // SAFETY: Tests run with mutex lock, so env var access is serialized
+            unsafe {
+                std::env::set_var("DEV_CACHE_DIR", &cache_path);
+                std::env::set_var("DEV_CONFIG_DIR", &config_path);
+            }
+
+            TestEnv {
+                _temp_dir: temp_dir,
+                cache_path,
+                config_path,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            // SAFETY: Tests run with mutex lock, so env var access is serialized
+            unsafe {
+                std::env::remove_var("DEV_CACHE_DIR");
+                std::env::remove_var("DEV_CONFIG_DIR");
+            }
+        }
+    }
+
+    #[test]
+    fn test_package_ref_parse_channel() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let pkg = PackageRef::parse("nixpkgs.git").unwrap();
+        assert!(matches!(pkg, PackageRef::Channel { source, attr } if source == "nixpkgs" && attr == "git"));
+    }
+
+    #[test]
+    fn test_package_ref_parse_flake() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let pkg = PackageRef::parse("nixpkgs#hello").unwrap();
+        assert!(matches!(pkg, PackageRef::Flake { source, attr } if source == "nixpkgs" && attr == "hello"));
+    }
+
+    #[test]
+    fn test_package_ref_parse_no_prefix() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let pkg = PackageRef::parse("git");
+        assert!(pkg.is_none());
+    }
+
+    #[test]
+    fn test_package_ref_to_string() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let channel = PackageRef::Channel {
+            source: "nixpkgs".to_string(),
+            attr: "git".to_string(),
+        };
+        assert_eq!(channel.to_string(), "nixpkgs.git");
+
+        let flake = PackageRef::Flake {
+            source: "nixpkgs".to_string(),
+            attr: "hello".to_string(),
+        };
+        assert_eq!(flake.to_string(), "nixpkgs#hello");
+    }
+
+    #[test]
+    fn test_storage_new_empty() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let storage = Storage::new("test");
+        assert!(storage.is_new);
+        assert!(storage.packages.is_empty());
+    }
+
+    #[test]
+    fn test_storage_add_and_write() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.curl");
+        storage.write().unwrap();
+
+        // Reload and verify
+        let storage2 = Storage::new("test");
+        assert!(!storage2.is_new);
+        assert_eq!(storage2.packages.len(), 2);
+        assert!(storage2.contains("nixpkgs.git"));
+        assert!(storage2.contains("nixpkgs.curl"));
+    }
+
+    #[test]
+    fn test_storage_remove() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.curl");
+        storage.remove("nixpkgs.git");
+
+        assert!(!storage.contains("nixpkgs.git"));
+        assert!(storage.contains("nixpkgs.curl"));
+    }
+
+    #[test]
+    fn test_storage_migration_unprefixed() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        // Write unprefixed entries directly
+        let env_file = env.config_path.join("env.migration");
+        fs::write(&env_file, "git\ncurl\nvim").unwrap();
+
+        // Load and verify migration
+        let storage = Storage::new("migration");
+        assert_eq!(storage.packages.len(), 3);
+        assert!(storage.contains("nixpkgs.git"));
+        assert!(storage.contains("nixpkgs.curl"));
+        assert!(storage.contains("nixpkgs.vim"));
+    }
+
+    #[test]
+    fn test_storage_list_channels() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.curl");
+        storage.add("unstable.firefox");
+
+        let channels = storage.list_channels();
+        assert_eq!(channels.len(), 2);
+        assert!(channels.contains(&"nixpkgs".to_string()));
+        assert!(channels.contains(&"unstable".to_string()));
+    }
+
+    #[test]
+    fn test_storage_list_flakes() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs#hello");
+        storage.add("nixpkgs#cowsay");
+        storage.add("home-manager#home-manager");
+
+        let flakes = storage.list_flakes();
+        assert_eq!(flakes.len(), 2);
+        assert!(flakes.contains(&"nixpkgs".to_string()));
+        assert!(flakes.contains(&"home-manager".to_string()));
+    }
+
+    #[test]
+    fn test_storage_mixed_sources() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs#hello");
+
+        assert_eq!(storage.list_channels().len(), 1);
+        assert_eq!(storage.list_flakes().len(), 1);
+    }
+
+    #[test]
+    fn test_sources_new() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let _sources = Sources::new("test").unwrap();
+        assert!(env.cache_path.join("test/channels").exists());
+        assert!(env.cache_path.join("test/flakes").exists());
+    }
+
+    #[test]
+    fn test_sources_has_channel() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        // Create a fake channel GC root
+        let channel_path = env.cache_path.join("test/channels/nixpkgs");
+        fs::write(&channel_path, "fake").unwrap();
+
+        assert!(sources.has_channel("nixpkgs"));
+        assert!(!sources.has_channel("unstable"));
+    }
+
+    #[test]
+    fn test_sources_has_flake() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        // Create a fake flake GC root
+        let flake_path = env.cache_path.join("test/flakes/nixpkgs");
+        fs::write(&flake_path, "fake").unwrap();
+
+        assert!(sources.has_flake("nixpkgs"));
+        assert!(!sources.has_flake("home-manager"));
+    }
+
+    #[test]
+    fn test_sources_remove_channel() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        let channel_path = env.cache_path.join("test/channels/nixpkgs");
+        fs::write(&channel_path, "fake").unwrap();
+        assert!(channel_path.exists());
+
+        sources.remove_channel("nixpkgs");
+        assert!(!channel_path.exists());
+    }
+
+    #[test]
+    fn test_sources_remove_flake() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        let flake_path = env.cache_path.join("test/flakes/nixpkgs");
+        fs::write(&flake_path, "fake").unwrap();
+        assert!(flake_path.exists());
+
+        sources.remove_flake("nixpkgs");
+        assert!(!flake_path.exists());
+    }
+
+    #[test]
+    fn test_sources_list_roots() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        // Create fake GC roots
+        fs::write(env.cache_path.join("test/channels/nixpkgs"), "fake").unwrap();
+        fs::write(env.cache_path.join("test/channels/unstable"), "fake").unwrap();
+        fs::write(env.cache_path.join("test/flakes/home-manager"), "fake").unwrap();
+
+        let channel_roots = sources.list_channel_roots();
+        assert_eq!(channel_roots.len(), 2);
+
+        let flake_roots = sources.list_flake_roots();
+        assert_eq!(flake_roots.len(), 1);
+    }
+
+    #[test]
+    fn test_sources_get_nix_path() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let sources = Sources::new("test").unwrap();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("unstable.firefox");
+
+        let nix_path = sources.get_nix_path(&storage);
+        assert!(nix_path.contains("nixpkgs="));
+        assert!(nix_path.contains("unstable="));
+    }
+
+    #[test]
+    fn test_generate_nix_channels_only() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.curl");
+
+        let sources = Sources::new("test").unwrap();
+        let nix = generate_nix("test", &storage, &sources);
+
+        assert!(nix.contains("nixpkgs = import <nixpkgs> {};"));
+        assert!(nix.contains("(nixpkgs.curl)"));
+        assert!(nix.contains("(nixpkgs.git)"));
+        assert!(nix.contains("dev-test"));
+    }
+
+    #[test]
+    fn test_generate_nix_with_flakes() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let test_env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("myflake#hello");
+
+        let sources = Sources::new("test").unwrap();
+
+        // Create fake flake path
+        let flake_path = test_env.cache_path.join("test/flakes/myflake");
+        fs::write(&flake_path, "fake").unwrap();
+
+        let nix = generate_nix("test", &storage, &sources);
+
+        assert!(nix.contains("nixpkgs = import <nixpkgs> {};"));
+        assert!(nix.contains("_flake_myflake = import"));
+        assert!(nix.contains("(nixpkgs.git)"));
+        assert!(nix.contains("(_flake_myflake.hello)"));
+    }
+
+    #[test]
+    fn test_env_not_built_detection() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let test_env = TestEnv::new();
+
+        // Create a storage file but no result binary
+        let mut storage = Storage::new("unbuilt");
+        storage.add("nixpkgs.git");
+        storage.write().unwrap();
+
+        let bin_path = test_env.cache_path
+            .join("unbuilt/result/bin/dev-unbuilt");
+
+        assert!(!bin_path.exists());
+    }
+
+    #[test]
+    fn test_multiple_environments() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let env = TestEnv::new();
+
+        // Create multiple environments
+        let mut storage1 = Storage::new("env1");
+        storage1.add("nixpkgs.git");
+        storage1.write().unwrap();
+
+        let mut storage2 = Storage::new("env2");
+        storage2.add("nixpkgs.curl");
+        storage2.write().unwrap();
+
+        // Verify they're independent
+        let reload1 = Storage::new("env1");
+        let reload2 = Storage::new("env2");
+
+        assert!(reload1.contains("nixpkgs.git"));
+        assert!(!reload1.contains("nixpkgs.curl"));
+
+        assert!(reload2.contains("nixpkgs.curl"));
+        assert!(!reload2.contains("nixpkgs.git"));
+
+        // List all env files
+        let envs: Vec<String> = fs::read_dir(&env.config_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| name.starts_with("env."))
+            .collect();
+
+        assert_eq!(envs.len(), 2);
+    }
+
+    #[test]
+    fn test_package_ref_source_name() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let channel = PackageRef::Channel {
+            source: "nixpkgs".to_string(),
+            attr: "git".to_string(),
+        };
+        assert_eq!(channel.source_name(), "nixpkgs");
+
+        let flake = PackageRef::Flake {
+            source: "home-manager".to_string(),
+            attr: "home-manager".to_string(),
+        };
+        assert_eq!(flake.source_name(), "home-manager");
+    }
+
+    #[test]
+    fn test_package_ref_to_nix_expr() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        let channel = PackageRef::Channel {
+            source: "nixpkgs".to_string(),
+            attr: "git".to_string(),
+        };
+        assert_eq!(channel.to_nix_expr(), "nixpkgs.git");
+
+        let flake = PackageRef::Flake {
+            source: "myflake".to_string(),
+            attr: "hello".to_string(),
+        };
+        assert_eq!(flake.to_nix_expr(), "_flake_myflake.hello");
+    }
+
+    #[test]
+    fn test_storage_packages_sorted() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.zsh");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.curl");
+
+        assert_eq!(storage.packages[0], "nixpkgs.curl");
+        assert_eq!(storage.packages[1], "nixpkgs.git");
+        assert_eq!(storage.packages[2], "nixpkgs.zsh");
+    }
+
+    #[test]
+    fn test_storage_no_duplicates() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs.git");
+
+        assert_eq!(storage.packages.len(), 1);
+    }
+
+    #[test]
+    fn test_storage_get_refs() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("test");
+        storage.add("nixpkgs.git");
+        storage.add("nixpkgs#hello");
+
+        let refs = storage.get_refs();
+        assert_eq!(refs.len(), 2);
+
+        assert!(refs.iter().any(|r| matches!(r, PackageRef::Channel { source, attr } if source == "nixpkgs" && attr == "git")));
+        assert!(refs.iter().any(|r| matches!(r, PackageRef::Flake { source, attr } if source == "nixpkgs" && attr == "hello")));
     }
 }
