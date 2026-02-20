@@ -445,11 +445,18 @@ impl Sources {
     }
 }
 
+fn nix_eval(expr: &str, raw: bool, nix_path: Option<&str>) -> Result<SpawnResult> {
+    let args: Vec<&str> = if raw {
+        vec!["eval", "--raw", "--impure", "--expr", expr]
+    } else {
+        vec!["eval", "--impure", "--expr", expr]
+    };
+    spawn("nix", &args, true, nix_path)
+}
+
 fn resolve_channel(name: &str) -> Result<String> {
     let expr = format!("(<{}>)", name);
-    let args = vec!["eval", "--raw", "--impure", "--expr", &expr];
-
-    let result = spawn("nix", &args, true, None)?;
+    let result = nix_eval(&expr, true, None)?;
 
     let path = result.stdout.trim();
     if !path.starts_with('/') {
@@ -461,9 +468,7 @@ fn resolve_channel(name: &str) -> Result<String> {
 
 fn resolve_flake(name: &str) -> Result<String> {
     let expr = format!("(builtins.getFlake \"{}\").outPath", name);
-    let args = vec!["eval", "--raw", "--impure", "--expr", &expr];
-
-    let result = spawn("nix", &args, true, None)?;
+    let result = nix_eval(&expr, true, None)?;
 
     let path = result.stdout.trim();
     if !path.starts_with('/') {
@@ -475,16 +480,13 @@ fn resolve_flake(name: &str) -> Result<String> {
 
 fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources, storage: &Storage) -> Result<bool> {
     let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
-
     let expr = format!(
         "(let ch = (import <{}> {{}}); in ch ? {})",
         channel,
         attr_parts.join(".")
     );
 
-    let args = vec!["eval", "--impure", "--expr", &expr];
-
-    let result = spawn("nix", &args, true, Some(&sources.get_nix_path(storage)))?;
+    let result = nix_eval(&expr, false, Some(&sources.get_nix_path(storage)))?;
 
     if !result.success {
         bail!("nix: {}", result.stderr.trim());
@@ -507,9 +509,7 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
         attr_parts.join(".")
     );
 
-    let args = vec!["eval", "--impure", "--expr", &expr];
-    let result = spawn("nix", &args, true, None)?;
-
+    let result = nix_eval(&expr, false, None)?;
     if result.success && result.stdout.trim() == "true" {
         return Ok(true);
     }
@@ -521,8 +521,7 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
         attr_parts.join(".")
     );
 
-    let args = vec!["eval", "--impure", "--expr", &expr];
-    let result = spawn("nix", &args, true, None)?;
+    let result = nix_eval(&expr, false, None)?;
 
     if !result.success {
         bail!("nix: {}", result.stderr.trim());
