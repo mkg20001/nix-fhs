@@ -8,13 +8,13 @@ Ever wanted to just get something to run on nixOS, quick and dirty, without the 
 
 Now there's the nix-dev cli
 
-Create an environment using `$ dev add -e test-environment some-package another package`
+Create an environment using `$ fhs add -e test-environment some-package another package`
 
-For example `$ dev add -e headers zlib`
+For example `$ fhs add -e headers zlib`
 
 Now you've got an environment named `headers` that includes the zlib binary, library and include files
 
-You can enter it with `$ dev enter headers` which will spawn your default shell
+You can enter it with `$ fhs enter headers` which will spawn your default shell
 
 # Usage
 
