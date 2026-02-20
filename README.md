@@ -6,11 +6,11 @@ CLI for managing FHS environments on nixOS
 
 FHS stands for first-hand shell aka the environment you find on most linux distributions, containing /usr/bin, /usr/lib, and all the other folders nixos doesn't have.
 
-Sometimes a FHS may be necesarry for an application to run or it might be easier to get the application running by simulating an FHS.
+Sometimes a FHS may be necessary for an application to run or it might be easier to get the application running by simulating an FHS.
 
-Additionally for some compilation operations it may be easier to just have all the headers in /usr/include as they are expected, instead of patching scripts lasyers deep.
+Additionally for some compilation operations it may be easier to just have all the headers in /usr/include as they are expected, instead of patching scripts layers deep.
 
-nix-fhs makes this rather convoluted mechanism easy to use by providing commands to easily create, manage and update multiple indipendent fhs environments
+nix-fhs makes this rather convoluted mechanism easy to use by providing commands to easily create, manage and update multiple independent fhs environments
 
 # Getting started
 
