@@ -183,7 +183,6 @@ impl PackageRef {
         match self {
             PackageRef::Channel { source, attr } => format!("{}.{}", source, attr),
             PackageRef::Flake { source, attr } => {
-                // Flakes are imported directly, so they work like channels
                 format!("_flake_{}.{}", source, attr)
             }
         }
@@ -563,7 +562,10 @@ fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
     let flake_imports: String = sources
         .get_flake_paths(storage)
         .iter()
-        .map(|(name, path)| format!("  _flake_{} = import {} {{}};", name, path.display()))
+        .map(|(name, path)| {
+            let resolved = fs::read_link(path).unwrap();
+            format!("  _flake_{} = (let flake = builtins.getFlake(\"{}\"); in (if flake ? legacyPackages.${{builtins.currentSystem}} then flake.legacyPackages.${{builtins.currentSystem}} else flake.packages.${{builtins.currentSystem}}));", name, resolved.display())
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -600,8 +602,8 @@ in
   ];
 
   profile = ''
-    export IS_DEV=1
-    export DEV_ENV="{name}"
+    export IS_FHS=1
+    export FHS_ENV="{name}"
   '';
 
   runScript = ''$SHELL'';
