@@ -6,7 +6,7 @@ CLI for managing FHS environments on nixOS
 
 Ever wanted to just get something to run on nixOS, quick and dirty, without the hassle of doing it properly?
 
-Now there's the nix-dev cli
+Now there's the nix-fhs cli
 
 Create an environment using `$ fhs add -e test-environment some-package another package`
 
@@ -19,7 +19,7 @@ You can enter it with `$ fhs enter headers` which will spawn your default shell
 # Usage
 
 ```
-Nix development environment manager
+CLI for managing FHS environments on nixOS
 
 Usage: fhs [OPTIONS] [COMMAND]
 

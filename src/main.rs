@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 #[derive(Parser)]
 #[command(name = "fhs")]
-#[command(about = "Nix development environment manager", long_about = None)]
+#[command(about = "CLI for managing FHS environments on nixOS", long_about = None)]
 struct Cli {
     /// Environment to use
     #[arg(short, long, default_value = "default", global = true)]
