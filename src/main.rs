@@ -1005,7 +1005,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
         rebuild(env, &storage, &sources, verbose)?;
     }
 
-    // exec into the dev environment
+    // exec into the fhs environment
     let nix_path = sources.get_nix_path(&storage);
     let err = Command::new(&bin)
         .env("NIX_PATH", &nix_path)
@@ -1392,7 +1392,7 @@ mod tests {
         storage.write().unwrap();
 
         let bin_path = test_env.cache_path
-            .join("unbuilt/result/bin/dev-unbuilt");
+            .join("unbuilt/result/bin/fhs-unbuilt");
 
         assert!(!bin_path.exists());
     }
