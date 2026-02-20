@@ -698,6 +698,18 @@ fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<
         }
     }
 
+    for channel in needed_channels {
+        if !sources.has_channel(&channel) {
+            sources.update_channel(&channel, verbose)?;
+        }
+    }
+
+    for flake in needed_flakes {
+        if !sources.has_flake(&flake) {
+            sources.update_flake(&flake, verbose)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1356,9 +1368,9 @@ mod tests {
         let sources = Sources::new("test").unwrap();
         let nix = generate_nix("test", &storage, &sources);
 
-        assert!(nix.contains("nixpkgs = import <nixpkgs> {};"));
-        assert!(nix.contains("(nixpkgs.curl)"));
-        assert!(nix.contains("(nixpkgs.git)"));
+        assert!(nix.contains("_channel_nixpkgs = import <nixpkgs> {};"));
+        assert!(nix.contains("(_channel_nixpkgs.curl)"));
+        assert!(nix.contains("(_channel_nixpkgs.git)"));
         assert!(nix.contains("fhs-test"));
     }
 
@@ -1375,13 +1387,13 @@ mod tests {
 
         // Create fake flake path
         let flake_path = test_env.cache_path.join("test/flakes/myflake");
-        fs::write(&flake_path, "fake").unwrap();
+        std::os::unix::fs::symlink("/flake", &flake_path).unwrap();
 
         let nix = generate_nix("test", &storage, &sources);
 
-        assert!(nix.contains("nixpkgs = import <nixpkgs> {};"));
-        assert!(nix.contains("_flake_myflake = import"));
-        assert!(nix.contains("(nixpkgs.git)"));
+        assert!(nix.contains("_channel_nixpkgs = import <nixpkgs> {};"));
+        assert!(nix.contains("_flake_myflake = (let flake "));
+        assert!(nix.contains("(_channel_nixpkgs.git)"));
         assert!(nix.contains("(_flake_myflake.hello)"));
     }
 
