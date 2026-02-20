@@ -181,7 +181,9 @@ impl PackageRef {
     /// Returns the nix expression to access this package
     fn to_nix_expr(&self) -> String {
         match self {
-            PackageRef::Channel { source, attr } => format!("{}.{}", source, attr),
+            PackageRef::Channel { source, attr } => {
+                format!("_channel_{}.{}", source, attr)
+            },
             PackageRef::Flake { source, attr } => {
                 format!("_flake_{}.{}", source, attr)
             }
@@ -555,7 +557,7 @@ fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
     let channel_imports: String = storage
         .list_channels()
         .iter()
-        .map(|ch| format!("  {} = import <{}> {{}};", ch, ch))
+        .map(|ch| format!("  _channel_{} = import <{}> {{}};", ch, ch))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1459,7 +1461,7 @@ mod tests {
             source: "nixpkgs".to_string(),
             attr: "git".to_string(),
         };
-        assert_eq!(channel.to_nix_expr(), "nixpkgs.git");
+        assert_eq!(channel.to_nix_expr(), "_channel_nixpkgs.git");
 
         let flake = PackageRef::Flake {
             source: "myflake".to_string(),
