@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Parser)]
-#[command(name = "dev")]
+#[command(name = "fhs")]
 #[command(about = "Nix development environment manager", long_about = None)]
 struct Cli {
     /// Environment to use
@@ -75,7 +75,7 @@ fn cache_dir() -> PathBuf {
     if let Ok(path) = std::env::var("DEV_CACHE_DIR") {
         PathBuf::from(path)
     } else {
-        dirs::cache_dir().unwrap().join("dev")
+        dirs::cache_dir().unwrap().join("fhs")
     }
 }
 
@@ -83,7 +83,7 @@ fn config_dir() -> PathBuf {
     if let Ok(path) = std::env::var("DEV_CONFIG_DIR") {
         PathBuf::from(path)
     } else {
-        dirs::config_dir().unwrap().join("dev")
+        dirs::config_dir().unwrap().join("fhs")
     }
 }
 
@@ -589,7 +589,7 @@ let
 {all_imports}
 in
 (pkgs.buildFHSEnv {{
-  name = "dev-{name}";
+  name = "fhs-{name}";
   extraOutputsToInstall = ["include" "dev"];
 
   targetPkgs = pkgs: with pkgs; [
@@ -703,9 +703,9 @@ fn env_not_found(env: &str) {
         env
     );
     if env == "default" {
-        eprintln!(" $ dev add <package>");
+        eprintln!(" $ fhs add <package>");
     } else {
-        eprintln!(" $ dev add -e {} <package>", env);
+        eprintln!(" $ fhs add -e {} <package>", env);
     }
     std::process::exit(1);
 }
@@ -988,15 +988,15 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
         .join(env)
         .join("result")
         .join("bin")
-        .join(format!("dev-{}", env));
+        .join(format!("fhs-{}", env));
 
     if !bin.exists() {
         if !auto_rebuild {
             eprintln!("Environment needs rebuild, auto-rebuild disabled");
             if env == "default" {
-                eprintln!(" $ dev rebuild");
+                eprintln!(" $ fhs rebuild");
             } else {
-                eprintln!(" $ dev rebuild -e {}", env);
+                eprintln!(" $ fhs rebuild -e {}", env);
             }
             std::process::exit(1);
         }
@@ -1355,7 +1355,7 @@ mod tests {
         assert!(nix.contains("nixpkgs = import <nixpkgs> {};"));
         assert!(nix.contains("(nixpkgs.curl)"));
         assert!(nix.contains("(nixpkgs.git)"));
-        assert!(nix.contains("dev-test"));
+        assert!(nix.contains("fhs-test"));
     }
 
     #[test]

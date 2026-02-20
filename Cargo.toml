@@ -1,10 +1,10 @@
 [package]
-name = "nix-dev"
+name = "nix-fhs"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "dev"
+name = "fhs"
 path = "src/main.rs"
 
 [dependencies]
