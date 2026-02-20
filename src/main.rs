@@ -1525,4 +1525,25 @@ mod tests {
         assert!(refs.iter().any(|r| matches!(r, PackageRef::Channel { source, attr } if source == "nixpkgs" && attr == "git")));
         assert!(refs.iter().any(|r| matches!(r, PackageRef::Flake { source, attr } if source == "nixpkgs" && attr == "hello")));
     }
+
+    #[test]
+    fn test_interop_add_mixed() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        cmd_add("add-mixed", vec!["nixpkgs#hello".into(), "nixpkgs.nixVersions.latest".into(), "cloud-utils".into()], true, true).unwrap();
+    }
+
+    #[test]
+    fn test_interop_build_mixed() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        let mut storage = Storage::new("build-mixed");
+        storage.add("nixpkgs.nixVersions.latest");
+        storage.add("nixpkgs#hello");
+        storage.write().unwrap();
+
+        cmd_rebuild("build-mixed", true).unwrap();
+    }
 }
