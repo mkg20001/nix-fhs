@@ -193,12 +193,19 @@ impl Storage {
         let disk_path = config_dir().join(format!("env.{}", env));
         let is_new = !disk_path.exists();
 
-        let packages = if disk_path.exists() {
+        let packages: Vec<String> = if disk_path.exists() {
             fs::read_to_string(&disk_path)
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| !l.is_empty())
-                .map(String::from)
+                .map(|l| {
+                    // Convert entries without . or # to nixpkgs.entry
+                    if !l.contains('.') && !l.contains('#') {
+                        format!("nixpkgs.{}", l)
+                    } else {
+                        l.to_string()
+                    }
+                })
                 .collect()
         } else {
             Vec::new()
