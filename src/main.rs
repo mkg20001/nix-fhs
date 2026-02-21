@@ -253,7 +253,7 @@ impl Storage {
     }
 
     fn list_channels(&self) -> Vec<String> {
-        let mut channels: Vec<String> = self
+        /* let mut channels: Vec<String> = self
             .packages
             .iter()
             .filter_map(|p| PackageRef::parse(p))
@@ -264,6 +264,23 @@ impl Storage {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        channels.sort();
+        channels */
+
+        // TODO: this is a hack to always have nixpkgs channel as it's currently required for building
+        let mut channels: HashSet<String> = self
+            .packages
+            .iter()
+            .filter_map(|p| PackageRef::parse(p))
+            .filter_map(|r| match r {
+                PackageRef::Channel { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect();
+
+        channels.insert("nixpkgs".to_string());
+
+        let mut channels: Vec<String> = channels.into_iter().collect();
         channels.sort();
         channels
     }
@@ -654,11 +671,6 @@ fn rebuild(env: &str, storage: &Storage, sources: &Sources, verbose: bool) -> Re
 }
 
 fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<()> {
-    // Ensure nixpkgs channel exists (needed for buildFHSEnv)
-    if !sources.has_channel("nixpkgs") {
-        sources.update_channel("nixpkgs", verbose)?;
-    }
-
     // Determine which sources we need
     let refs = storage.get_refs();
 
@@ -678,9 +690,9 @@ fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<
         })
         .collect();
 
-    // GC unused channels (but always keep nixpkgs)
+    // GC unused channels
     for channel in sources.list_channel_roots() {
-        if channel != "nixpkgs" && !needed_channels.contains(&channel) {
+        if !needed_channels.contains(&channel) {
             if verbose {
                 eprintln!("GC channel: {}", channel);
             }
@@ -742,6 +754,13 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                 // No prefix, try nixpkgs.pkg first, then nixpkgs#pkg
                 if verbose {
                     eprintln!("{}: no source prefix, trying nixpkgs.{}", pkg, pkg);
+                }
+
+                // TODO: this is a hack. ideally we would pre-cache all channels and flakes and use the cached version
+                // but since we require nixpkgs to be always present for now, this should just work out for now
+                if !sources.has_channel("nixpkgs") {
+                    eprintln!("need nixpkgs, updating");
+                    sources.update_channel("nixpkgs", verbose)?;
                 }
 
                 let channel_ref = PackageRef::Channel {
