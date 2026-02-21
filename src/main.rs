@@ -67,6 +67,13 @@ enum Commands {
         json: bool,
     },
 
+    /// List all environments
+    List {
+        /// Print list in JSON
+        #[arg(short, long)]
+        json: bool,
+    },
+
     /// Enter an environment
     Enter,
 }
@@ -1012,6 +1019,52 @@ fn cmd_info(env: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_list(json: bool) -> Result<()> {
+    let envs: Vec<String> = fs::read_dir(config_dir())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|name| name.starts_with("env."))
+                .map(|name| name.strip_prefix("env.").unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if json {
+        let mut env_data: Vec<serde_json::Value> = Vec::new();
+        for env in &envs {
+            let storage = Storage::new(env);
+            env_data.push(serde_json::json!({
+                "name": env,
+                "packages": storage.packages,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&env_data)?);
+    } else {
+        if envs.is_empty() {
+            println!("No environments found.");
+            println!("\nCreate one with:");
+            println!("  $ fhs add <package>");
+        } else {
+            for env in &envs {
+                let storage = Storage::new(env);
+                println!("{}:", env);
+                if storage.packages.is_empty() {
+                    println!("  <empty>");
+                } else {
+                    for pkg in &storage.packages {
+                        println!("  - {}", pkg);
+                    }
+                }
+                println!();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let storage = Storage::new(env);
     if storage.is_new {
@@ -1068,6 +1121,7 @@ fn main() {
             cmd_update(&cli.env, fetch, all, auto_rebuild, cli.verbose)
         }
         Some(Commands::Info { json }) => cmd_info(&cli.env, json),
+        Some(Commands::List { json }) => cmd_list(json),
         Some(Commands::Enter) | None => cmd_enter(&cli.env, auto_rebuild, cli.verbose),
     };
 
@@ -1564,5 +1618,35 @@ mod tests {
         storage.write().unwrap();
 
         cmd_rebuild("build-mixed", true).unwrap();
+    }
+
+    #[test]
+    fn test_cmd_list_empty() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        // Should not error with no environments
+        cmd_list(false).unwrap();
+        cmd_list(true).unwrap();
+    }
+
+    #[test]
+    fn test_cmd_list_with_envs() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _env = TestEnv::new();
+
+        // Create some environments
+        let mut storage1 = Storage::new("list-test1");
+        storage1.add("nixpkgs.git");
+        storage1.add("nixpkgs.curl");
+        storage1.write().unwrap();
+
+        let mut storage2 = Storage::new("list-test2");
+        storage2.add("nixpkgs#hello");
+        storage2.write().unwrap();
+
+        // Should not error
+        cmd_list(false).unwrap();
+        cmd_list(true).unwrap();
     }
 }
