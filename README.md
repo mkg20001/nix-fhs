@@ -12,6 +12,8 @@ Additionally for some compilation operations it may be easier to just have all t
 
 nix-fhs makes this rather convoluted mechanism easy to use by providing commands to easily create, manage and update multiple independent fhs environments
 
+Note that this is similar to nix-ld, but goes beyond just binaries with dynamic linking.
+
 # Getting started
 
 Create an environment using `$ fhs add -e test-environment some-package another package`
