@@ -746,6 +746,13 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
 
     let mut had_errors = false;
 
+    // TODO: this is a hack. ideally we would pre-cache all channels and flakes and use the cached version
+    // but since we require nixpkgs to be always present for now, this should just work out for now
+    if !sources.has_channel("nixpkgs") {
+        eprintln!("need nixpkgs, updating");
+        sources.update_channel("nixpkgs", verbose)?;
+    }
+
     for pkg in pkgs {
         // Parse the package reference
         let pkg_ref = match PackageRef::parse(&pkg) {
@@ -754,13 +761,6 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                 // No prefix, try nixpkgs.pkg first, then nixpkgs#pkg
                 if verbose {
                     eprintln!("{}: no source prefix, trying nixpkgs.{}", pkg, pkg);
-                }
-
-                // TODO: this is a hack. ideally we would pre-cache all channels and flakes and use the cached version
-                // but since we require nixpkgs to be always present for now, this should just work out for now
-                if !sources.has_channel("nixpkgs") {
-                    eprintln!("need nixpkgs, updating");
-                    sources.update_channel("nixpkgs", verbose)?;
                 }
 
                 let channel_ref = PackageRef::Channel {
