@@ -37,6 +37,7 @@ Commands:
   rebuild  Rebuild an environment
   update   Update an environment
   info     Print infos about an environment
+  list     List all environments
   enter    Enter an environment
   help     Print this message or the help of the given subcommand(s)
 
