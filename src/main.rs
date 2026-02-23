@@ -76,6 +76,9 @@ enum Commands {
 
     /// Enter an environment
     Enter,
+
+    /// Update global nixpkgs (used for buildFHSEnv)
+    UpdateGlobal,
 }
 
 fn cache_dir() -> PathBuf {
@@ -260,7 +263,7 @@ impl Storage {
     }
 
     fn list_channels(&self) -> Vec<String> {
-        /* let mut channels: Vec<String> = self
+        let mut channels: Vec<String> = self
             .packages
             .iter()
             .filter_map(|p| PackageRef::parse(p))
@@ -271,23 +274,6 @@ impl Storage {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        channels.sort();
-        channels */
-
-        // TODO: this is a hack to always have nixpkgs channel as it's currently required for building
-        let mut channels: HashSet<String> = self
-            .packages
-            .iter()
-            .filter_map(|p| PackageRef::parse(p))
-            .filter_map(|r| match r {
-                PackageRef::Channel { source, .. } => Some(source),
-                _ => None,
-            })
-            .collect();
-
-        channels.insert("nixpkgs".to_string());
-
-        let mut channels: Vec<String> = channels.into_iter().collect();
         channels.sort();
         channels
     }
@@ -485,6 +471,77 @@ impl Sources {
     }
 }
 
+/// Manages global nixpkgs used for buildFHSEnv (independent of environments)
+struct GlobalSources {
+    path: PathBuf,
+}
+
+impl GlobalSources {
+    fn new() -> Result<Self> {
+        let path = cache_dir().join("global");
+        fs::create_dir_all(&path)?;
+        Ok(GlobalSources { path })
+    }
+
+    fn nixpkgs_path(&self) -> PathBuf {
+        self.path.join("nixpkgs")
+    }
+
+    fn has_nixpkgs(&self) -> bool {
+        self.nixpkgs_path().exists()
+    }
+
+    fn update_nixpkgs(&self, verbose: bool) -> Result<()> {
+        if verbose {
+            eprintln!("Updating global nixpkgs");
+        }
+
+        let channel_path = resolve_channel("nixpkgs")?;
+
+        let gc_root = self.nixpkgs_path();
+        if gc_root.exists() {
+            fs::remove_file(&gc_root).ok();
+        }
+
+        let result = spawn(
+            "nix-store",
+            &[
+                "--realise",
+                &channel_path,
+                "--indirect",
+                "--add-root",
+                gc_root.to_str().unwrap(),
+            ],
+            true,
+            None,
+        )?;
+
+        if !result.success {
+            bail!(
+                "Failed to update global nixpkgs: {}",
+                result.stderr.trim()
+            );
+        }
+
+        Ok(())
+    }
+
+    fn ensure_nixpkgs(&self, verbose: bool) -> Result<()> {
+        if !self.has_nixpkgs() {
+            self.update_nixpkgs(verbose)?;
+        }
+        Ok(())
+    }
+
+    fn get_nixpkgs_store_path(&self) -> Result<PathBuf> {
+        let gc_root = self.nixpkgs_path();
+        if !gc_root.exists() {
+            bail!("Global nixpkgs not initialized. Run 'fhs update-global' first.");
+        }
+        fs::canonicalize(&gc_root).context("Failed to resolve global nixpkgs path")
+    }
+}
+
 fn nix_eval(expr: &str, raw: bool, nix_path: Option<&str>) -> Result<SpawnResult> {
     let args: Vec<&str> = if raw {
         vec!["eval", "--raw", "--impure", "--expr", expr]
@@ -577,7 +634,7 @@ fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources, storage: &Stora
     }
 }
 
-fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
+fn generate_nix(name: &str, storage: &Storage, sources: &Sources, global_nixpkgs: &PathBuf) -> String {
     let channel_imports: String = storage
         .list_channels()
         .iter()
@@ -610,10 +667,11 @@ fn generate_nix(name: &str, storage: &Storage, sources: &Sources) -> String {
         format!("{}\n{}", channel_imports, flake_imports)
     };
 
-    format!(
-        r#"{{ pkgs ? import <nixpkgs> {{}} }}:
+    let global_nixpkgs_path = global_nixpkgs.display();
 
-let
+    format!(
+        r#"let
+  pkgs = import {global_nixpkgs_path} {{}};
 {all_imports}
 in
 (pkgs.buildFHSEnv {{
@@ -634,24 +692,29 @@ in
 
   runScript = ''$SHELL'';
 }})"#,
+        global_nixpkgs_path = global_nixpkgs_path,
         all_imports = all_imports,
         name = name,
         packages = packages,
     )
 }
 
-fn rebuild(env: &str, storage: &Storage, sources: &Sources, verbose: bool) -> Result<()> {
+fn rebuild(env: &str, storage: &Storage, sources: &Sources, global: &GlobalSources, verbose: bool) -> Result<()> {
     let env_cache = cache_dir().join(env);
     fs::create_dir_all(&env_cache)?;
 
     let nix_path = env_cache.join("default.nix");
     let result_path = env_cache.join("result");
 
+    // Ensure global nixpkgs is available
+    global.ensure_nixpkgs(verbose)?;
+    let global_nixpkgs = global.get_nixpkgs_store_path()?;
+
     if verbose {
         eprintln!("Generating nix expression");
     }
 
-    let nix_content = generate_nix(env, storage, sources);
+    let nix_content = generate_nix(env, storage, sources, &global_nixpkgs);
     fs::write(&nix_path, &nix_content)?;
 
     if verbose {
@@ -748,17 +811,11 @@ fn env_not_found(env: &str) {
 fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let mut storage = Storage::new(env);
     let sources = Sources::new(env)?;
+    let global = GlobalSources::new()?;
 
     routine_stuff(&storage, &sources, verbose)?;
 
     let mut had_errors = false;
-
-    // TODO: this is a hack. ideally we would pre-cache all channels and flakes and use the cached version
-    // but since we require nixpkgs to be always present for now, this should just work out for now
-    if !sources.has_channel("nixpkgs") {
-        eprintln!("need nixpkgs, updating");
-        sources.update_channel("nixpkgs", verbose)?;
-    }
 
     for pkg in pkgs {
         // Parse the package reference
@@ -815,6 +872,18 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
             }
         };
 
+        // Ensure source is available before checking package exists
+        if !sources.has(&pkg_ref) {
+            if verbose {
+                eprintln!("Adding source: {}", pkg_ref.source_name());
+            }
+            if let Err(e) = sources.update_source(&pkg_ref, verbose) {
+                eprintln!("{}: failed to add source: {}", pkg_ref.to_string(), e);
+                had_errors = true;
+                continue;
+            }
+        }
+
         // Verify package exists
         match check_package_exists(&pkg_ref, &sources, &storage) {
             Ok(true) => {}
@@ -830,25 +899,13 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
             }
         }
 
-        // Ensure source is available
-        if !sources.has(&pkg_ref) {
-            if verbose {
-                eprintln!("Adding source: {}", pkg_ref.source_name());
-            }
-            if let Err(e) = sources.update_source(&pkg_ref, verbose) {
-                eprintln!("{}: failed to add source: {}", pkg_ref.to_string(), e);
-                had_errors = true;
-                continue;
-            }
-        }
-
         storage.add(&pkg_ref.to_string());
     }
 
     storage.write()?;
 
     if auto_rebuild {
-        rebuild(env, &storage, &sources, verbose)?;
+        rebuild(env, &storage, &sources, &global, verbose)?;
     }
 
     if had_errors {
@@ -861,6 +918,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
 fn cmd_rm(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let mut storage = Storage::new(env);
     let sources = Sources::new(env)?;
+    let global = GlobalSources::new()?;
 
     for pkg in pkgs {
         // Try exact match first
@@ -899,7 +957,7 @@ fn cmd_rm(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Re
     storage.write()?;
 
     if auto_rebuild {
-        rebuild(env, &storage, &sources, verbose)?;
+        rebuild(env, &storage, &sources, &global, verbose)?;
     }
 
     Ok(())
@@ -912,9 +970,10 @@ fn cmd_rebuild(env: &str, verbose: bool) -> Result<()> {
     }
 
     let sources = Sources::new(env)?;
+    let global = GlobalSources::new()?;
 
     routine_stuff(&storage, &sources, verbose)?;
-    rebuild(env, &storage, &sources, verbose)?;
+    rebuild(env, &storage, &sources, &global, verbose)?;
 
     Ok(())
 }
@@ -924,6 +983,8 @@ fn cmd_update(env: &str, fetch: bool, all: bool, auto_rebuild: bool, verbose: bo
         println!("Fetching channels...");
         spawn_inherit("nix-channel", &["--update", "-vv"], None)?;
     }
+
+    let global = GlobalSources::new()?;
 
     let envs: Vec<String> = if all {
         fs::read_dir(config_dir())
@@ -961,7 +1022,7 @@ fn cmd_update(env: &str, fetch: bool, all: bool, auto_rebuild: bool, verbose: bo
         }
 
         if auto_rebuild {
-            rebuild(&env, &storage, &sources, verbose)?;
+            rebuild(&env, &storage, &sources, &global, verbose)?;
         }
     }
 
@@ -1065,6 +1126,13 @@ fn cmd_list(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_update_global(verbose: bool) -> Result<()> {
+    let global = GlobalSources::new()?;
+    global.update_nixpkgs(verbose)?;
+    println!("Global nixpkgs updated successfully.");
+    Ok(())
+}
+
 fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
     let storage = Storage::new(env);
     if storage.is_new {
@@ -1072,6 +1140,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
     }
 
     let sources = Sources::new(env)?;
+    let global = GlobalSources::new()?;
     let bin = cache_dir()
         .join(env)
         .join("result")
@@ -1090,7 +1159,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
         }
 
         routine_stuff(&storage, &sources, verbose)?;
-        rebuild(env, &storage, &sources, verbose)?;
+        rebuild(env, &storage, &sources, &global, verbose)?;
     }
 
     // exec into the fhs environment
@@ -1122,6 +1191,7 @@ fn main() {
         }
         Some(Commands::Info { json }) => cmd_info(&cli.env, json),
         Some(Commands::List { json }) => cmd_list(json),
+        Some(Commands::UpdateGlobal) => cmd_update_global(cli.verbose),
         Some(Commands::Enter) | None => cmd_enter(&cli.env, auto_rebuild, cli.verbose),
     };
 
@@ -1439,8 +1509,10 @@ mod tests {
         storage.add("nixpkgs.curl");
 
         let sources = Sources::new("test").unwrap();
-        let nix = generate_nix("test", &storage, &sources);
+        let global_nixpkgs = PathBuf::from("/nix/store/fake-nixpkgs");
+        let nix = generate_nix("test", &storage, &sources, &global_nixpkgs);
 
+        assert!(nix.contains("pkgs = import /nix/store/fake-nixpkgs {};"));
         assert!(nix.contains("_channel_nixpkgs = import <nixpkgs> {};"));
         assert!(nix.contains("(_channel_nixpkgs.curl)"));
         assert!(nix.contains("(_channel_nixpkgs.git)"));
@@ -1462,8 +1534,10 @@ mod tests {
         let flake_path = test_env.cache_path.join("test/flakes/myflake");
         std::os::unix::fs::symlink("/flake", &flake_path).unwrap();
 
-        let nix = generate_nix("test", &storage, &sources);
+        let global_nixpkgs = PathBuf::from("/nix/store/fake-nixpkgs");
+        let nix = generate_nix("test", &storage, &sources, &global_nixpkgs);
 
+        assert!(nix.contains("pkgs = import /nix/store/fake-nixpkgs {};"));
         assert!(nix.contains("_channel_nixpkgs = import <nixpkgs> {};"));
         assert!(nix.contains("_flake_myflake = (let flake "));
         assert!(nix.contains("(_channel_nixpkgs.git)"));
