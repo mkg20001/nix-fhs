@@ -462,6 +462,21 @@ impl Sources {
             .join(":")
     }
 
+    /// Get NIX_PATH including all channels that exist on disk (for package checking)
+    fn get_nix_path_all(&self) -> String {
+        self.list_channel_roots()
+            .iter()
+            .map(|channel| {
+                format!(
+                    "{}={}",
+                    channel,
+                    self.channels_path.join(channel).display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
     fn get_flake_paths(&self, storage: &Storage) -> Vec<(String, PathBuf)> {
         storage
             .list_flakes()
@@ -575,7 +590,7 @@ fn resolve_flake(name: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources, storage: &Storage) -> Result<bool> {
+fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources) -> Result<bool> {
     let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
     let expr = format!(
         "(let ch = (import <{}> {{}}); in ch ? {})",
@@ -583,7 +598,7 @@ fn check_channel_package_exists(channel: &str, attr: &str, sources: &Sources, st
         attr_parts.join(".")
     );
 
-    let result = nix_eval(&expr, false, Some(&sources.get_nix_path(storage)))?;
+    let result = nix_eval(&expr, false, Some(&sources.get_nix_path_all()))?;
 
     if !result.success {
         bail!("nix: {}", result.stderr.trim());
@@ -627,9 +642,9 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
     Ok(result.stdout.trim() == "true")
 }
 
-fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources, storage: &Storage) -> Result<bool> {
+fn check_package_exists(pkg_ref: &PackageRef, sources: &Sources) -> Result<bool> {
     match pkg_ref {
-        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, sources, storage),
+        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, sources),
         PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr),
     }
 }
@@ -832,7 +847,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                     attr: pkg.clone(),
                 };
 
-                match check_package_exists(&channel_ref, &sources, &storage) {
+                match check_package_exists(&channel_ref, &sources) {
                     Ok(true) => {
                         if verbose {
                             eprintln!("{}: found as nixpkgs.{}", pkg, pkg);
@@ -849,7 +864,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                             attr: pkg.clone(),
                         };
 
-                        match check_package_exists(&flake_ref, &sources, &storage) {
+                        match check_package_exists(&flake_ref, &sources) {
                             Ok(true) => {
                                 if verbose {
                                     eprintln!("{}: found as nixpkgs#{}", pkg, pkg);
@@ -885,7 +900,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
         }
 
         // Verify package exists
-        match check_package_exists(&pkg_ref, &sources, &storage) {
+        match check_package_exists(&pkg_ref, &sources) {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!("{}: does not exist or fails to evaluate", pkg_ref.to_string());
