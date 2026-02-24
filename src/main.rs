@@ -864,7 +864,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
 
     routine_stuff(&storage, &sources, verbose)?;
 
-    let mut had_errors = false;
+    let mut errors: Vec<String> = Vec::new();
 
     for pkg in pkgs {
         // Parse the package reference
@@ -906,13 +906,11 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                                 flake_ref
                             }
                             Ok(false) => {
-                                eprintln!("{}: does not exist or fails to evaluate", pkg);
-                                had_errors = true;
+                                errors.push(format!("{}: does not exist or fails to evaluate", pkg));
                                 continue;
                             }
                             Err(e) => {
-                                eprintln!("{}: {}", pkg, e);
-                                had_errors = true;
+                                errors.push(format!("{}: {}", pkg, e));
                                 continue;
                             }
                         }
@@ -927,8 +925,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                 eprintln!("Adding source: {}", pkg_ref.source_name());
             }
             if let Err(e) = sources.update_source(&pkg_ref, verbose) {
-                eprintln!("{}: failed to add source: {}", pkg_ref.to_string(), e);
-                had_errors = true;
+                errors.push(format!("{}: failed to add source: {}", pkg_ref.to_string(), e));
                 continue;
             }
         }
@@ -937,13 +934,11 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
         match check_package_exists(&pkg_ref, verbose) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!("{}: does not exist or fails to evaluate", pkg_ref.to_string());
-                had_errors = true;
+                errors.push(format!("{}: does not exist or fails to evaluate", pkg_ref.to_string()));
                 continue;
             }
             Err(e) => {
-                eprintln!("{}: {}", pkg_ref.to_string(), e);
-                had_errors = true;
+                errors.push(format!("{}: {}", pkg_ref.to_string(), e));
                 continue;
             }
         }
@@ -957,7 +952,11 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
         rebuild(env, &storage, &sources, &global, verbose)?;
     }
 
-    if had_errors {
+    if !errors.is_empty() {
+        eprintln!("\nErrors:");
+        for error in &errors {
+            eprintln!("  - {}", error);
+        }
         std::process::exit(1);
     }
 
