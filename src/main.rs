@@ -589,7 +589,7 @@ fn resolve_flake(name: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
-fn check_channel_package_exists(channel: &str, attr: &str) -> Result<bool> {
+fn check_channel_package_exists(channel: &str, attr: &str, verbose: bool) -> Result<bool> {
     let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
     let expr = format!(
         "(let ch = (import <{}> {{}}); in ch ? {})",
@@ -601,10 +601,18 @@ fn check_channel_package_exists(channel: &str, attr: &str) -> Result<bool> {
     // If eval fails (e.g., empty NIX_PATH), treat as "not found" to allow flake fallback
     let result = match nix_eval(&expr, false, None) {
         Ok(r) => r,
-        Err(_) => return Ok(false),
+        Err(e) => {
+            if verbose {
+                eprintln!("channel check failed: {}", e);
+            }
+            return Ok(false);
+        }
     };
 
     if !result.success {
+        if verbose {
+            eprintln!("channel check failed: {}", result.stderr.trim());
+        }
         return Ok(false);
     }
 
@@ -646,9 +654,9 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
     Ok(result.stdout.trim() == "true")
 }
 
-fn check_package_exists(pkg_ref: &PackageRef) -> Result<bool> {
+fn check_package_exists(pkg_ref: &PackageRef, verbose: bool) -> Result<bool> {
     match pkg_ref {
-        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr),
+        PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, verbose),
         PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr),
     }
 }
@@ -851,7 +859,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                     attr: pkg.clone(),
                 };
 
-                match check_package_exists(&channel_ref) {
+                match check_package_exists(&channel_ref, verbose) {
                     Ok(true) => {
                         if verbose {
                             eprintln!("{}: found as nixpkgs.{}", pkg, pkg);
@@ -868,7 +876,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
                             attr: pkg.clone(),
                         };
 
-                        match check_package_exists(&flake_ref) {
+                        match check_package_exists(&flake_ref, verbose) {
                             Ok(true) => {
                                 if verbose {
                                     eprintln!("{}: found as nixpkgs#{}", pkg, pkg);
@@ -904,7 +912,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
         }
 
         // Verify package exists
-        match check_package_exists(&pkg_ref) {
+        match check_package_exists(&pkg_ref, verbose) {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!("{}: does not exist or fails to evaluate", pkg_ref.to_string());
