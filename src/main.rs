@@ -598,10 +598,14 @@ fn check_channel_package_exists(channel: &str, attr: &str) -> Result<bool> {
     );
 
     // Use system NIX_PATH (None) to check against all available system channels
-    let result = nix_eval(&expr, false, None)?;
+    // If eval fails (e.g., empty NIX_PATH), treat as "not found" to allow flake fallback
+    let result = match nix_eval(&expr, false, None) {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
 
     if !result.success {
-        bail!("nix: {}", result.stderr.trim());
+        return Ok(false);
     }
 
     Ok(result.stdout.trim() == "true")
