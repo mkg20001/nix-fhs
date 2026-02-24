@@ -619,9 +619,12 @@ fn check_channel_package_exists(channel: &str, attr: &str, verbose: bool) -> Res
     Ok(result.stdout.trim() == "true")
 }
 
-fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
+fn check_flake_package_exists(flake: &str, attr: &str, verbose: bool) -> Result<bool> {
     if !has_flakes() {
-        bail!("Flakes are not enabled in your nix installation");
+        if verbose {
+            eprintln!("flake check failed: flakes are not enabled");
+        }
+        return Ok(false);
     }
 
     let attr_parts: Vec<String> = attr.split('.').map(|s| format!("\"{}\"", s)).collect();
@@ -633,7 +636,15 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
         attr_parts.join(".")
     );
 
-    let result = nix_eval(&expr, false, None)?;
+    let result = match nix_eval(&expr, false, None) {
+        Ok(r) => r,
+        Err(e) => {
+            if verbose {
+                eprintln!("flake check failed: {}", e);
+            }
+            return Ok(false);
+        }
+    };
     if result.success && result.stdout.trim() == "true" {
         return Ok(true);
     }
@@ -645,10 +656,21 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
         attr_parts.join(".")
     );
 
-    let result = nix_eval(&expr, false, None)?;
+    let result = match nix_eval(&expr, false, None) {
+        Ok(r) => r,
+        Err(e) => {
+            if verbose {
+                eprintln!("flake check failed: {}", e);
+            }
+            return Ok(false);
+        }
+    };
 
     if !result.success {
-        bail!("nix: {}", result.stderr.trim());
+        if verbose {
+            eprintln!("flake check failed: {}", result.stderr.trim());
+        }
+        return Ok(false);
     }
 
     Ok(result.stdout.trim() == "true")
@@ -657,7 +679,7 @@ fn check_flake_package_exists(flake: &str, attr: &str) -> Result<bool> {
 fn check_package_exists(pkg_ref: &PackageRef, verbose: bool) -> Result<bool> {
     match pkg_ref {
         PackageRef::Channel { source, attr } => check_channel_package_exists(source, attr, verbose),
-        PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr),
+        PackageRef::Flake { source, attr } => check_flake_package_exists(source, attr, verbose),
     }
 }
 
