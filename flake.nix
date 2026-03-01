@@ -28,6 +28,7 @@
           version = "0.1.3";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          NIX_FHS_NIXPKGS_PATH = "${nixpkgs}";
         };
       }
     );

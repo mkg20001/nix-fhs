@@ -2,9 +2,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Hardcoded nixpkgs path set at compile time (used when built via nixpkgs)
+const HARDCODED_NIXPKGS_PATH: Option<&str> = option_env!("NIX_FHS_NIXPKGS_PATH");
 
 #[derive(Parser)]
 #[command(name = "fhs")]
@@ -483,15 +488,43 @@ impl GlobalSources {
         Ok(GlobalSources { path })
     }
 
+    fn is_hardcoded() -> bool {
+        HARDCODED_NIXPKGS_PATH.is_some()
+    }
+
     fn nixpkgs_path(&self) -> PathBuf {
         self.path.join("nixpkgs")
     }
 
     fn has_nixpkgs(&self) -> bool {
-        self.nixpkgs_path().exists()
+        Self::is_hardcoded() || self.nixpkgs_path().exists()
+    }
+
+    /// Check if the global nixpkgs gc root is older than 30 days
+    fn nixpkgs_older_than_month(&self) -> bool {
+        let gc_root = self.nixpkgs_path();
+        let metadata = match fs::symlink_metadata(&gc_root) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        let ctime = UNIX_EPOCH + Duration::from_secs(metadata.ctime() as u64);
+        let now = SystemTime::now();
+
+        match now.duration_since(ctime) {
+            Ok(age) => age.as_secs() > 30 * 24 * 60 * 60, // 30 days
+            Err(_) => false,
+        }
     }
 
     fn update_nixpkgs(&self, verbose: bool) -> Result<()> {
+        if Self::is_hardcoded() {
+            if verbose {
+                eprintln!("Using hardcoded nixpkgs path, skipping update");
+            }
+            return Ok(());
+        }
+
         if verbose {
             eprintln!("Updating global nixpkgs");
         }
@@ -548,6 +581,10 @@ impl GlobalSources {
     }
 
     fn get_nixpkgs_store_path(&self) -> Result<PathBuf> {
+        if let Some(hardcoded) = HARDCODED_NIXPKGS_PATH {
+            return Ok(PathBuf::from(hardcoded));
+        }
+
         let gc_root = self.nixpkgs_path();
         if !gc_root.exists() {
             bail!("Global nixpkgs not initialized. Run 'fhs update-global' first.");
@@ -789,7 +826,15 @@ fn rebuild(env: &str, storage: &Storage, sources: &Sources, global: &GlobalSourc
     Ok(())
 }
 
-fn routine_stuff(storage: &Storage, sources: &Sources, verbose: bool) -> Result<()> {
+fn routine_stuff(storage: &Storage, sources: &Sources, global: &GlobalSources, verbose: bool) -> Result<()> {
+    // Update global nixpkgs monthly (based on gc root ctime)
+    if !GlobalSources::is_hardcoded() && global.nixpkgs_older_than_month() {
+        if verbose {
+            eprintln!("Global nixpkgs older than 30 days, updating");
+        }
+        global.update_nixpkgs(verbose)?;
+    }
+
     // Determine which sources we need
     let refs = storage.get_refs();
 
@@ -862,7 +907,7 @@ fn cmd_add(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> R
     let sources = Sources::new(env)?;
     let global = GlobalSources::new()?;
 
-    routine_stuff(&storage, &sources, verbose)?;
+    routine_stuff(&storage, &sources, &global, verbose)?;
 
     let mut errors: Vec<String> = Vec::new();
 
@@ -1001,7 +1046,7 @@ fn cmd_rm(env: &str, pkgs: Vec<String>, auto_rebuild: bool, verbose: bool) -> Re
         println!("{}: not installed", pkg);
     }
 
-    routine_stuff(&storage, &sources, verbose)?;
+    routine_stuff(&storage, &sources, &global, verbose)?;
     storage.write()?;
 
     if auto_rebuild {
@@ -1020,7 +1065,7 @@ fn cmd_rebuild(env: &str, verbose: bool) -> Result<()> {
     let sources = Sources::new(env)?;
     let global = GlobalSources::new()?;
 
-    routine_stuff(&storage, &sources, verbose)?;
+    routine_stuff(&storage, &sources, &global, verbose)?;
     rebuild(env, &storage, &sources, &global, verbose)?;
 
     Ok(())
@@ -1057,7 +1102,7 @@ fn cmd_update(env: &str, fetch: bool, all: bool, auto_rebuild: bool, verbose: bo
 
         let sources = Sources::new(&env)?;
 
-        routine_stuff(&storage, &sources, verbose)?;
+        routine_stuff(&storage, &sources, &global, verbose)?;
 
         println!("Updating environment: {}", env);
 
@@ -1206,7 +1251,7 @@ fn cmd_enter(env: &str, auto_rebuild: bool, verbose: bool) -> Result<()> {
             std::process::exit(1);
         }
 
-        routine_stuff(&storage, &sources, verbose)?;
+        routine_stuff(&storage, &sources, &global, verbose)?;
         rebuild(env, &storage, &sources, &global, verbose)?;
     }
 
